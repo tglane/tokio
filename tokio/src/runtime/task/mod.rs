@@ -37,7 +37,7 @@
 //!  * `RUNNING` - Tracks whether the task is currently being polled or cancelled.
 //!    This bit functions as a lock around the task.
 //!
-//!  * `COMPLETE` - Is one once the future has fully completed and has been
+//!  * `COMPLETE` - Is one once the future has fully completed and the future is
 //!    dropped. Never unset once set. Never set together with RUNNING.
 //!
 //!  * `NOTIFIED` - Tracks whether a Notified object currently exists.

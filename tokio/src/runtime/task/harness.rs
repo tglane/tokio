@@ -284,21 +284,34 @@ where
     }
 
     pub(super) fn drop_join_handle_slow(self) {
-        // Try to unset `JOIN_INTEREST`. This must be done as a first step in
+        // Try to unset `JOIN_INTEREST` and `JOIN_WAKER`. This must be done as a first step in
         // case the task concurrently completed.
-        if self.state().unset_join_interested().is_err() {
-            // It is our responsibility to drop the output. This is critical as
-            // the task output may not be `Send` and as such must remain with
-            // the scheduler or `JoinHandle`. i.e. if the output remains in the
-            // task structure until the task is deallocated, it may be dropped
-            // by a Waker on any arbitrary thread.
-            //
-            // Panics are delivered to the user via the `JoinHandle`. Given that
-            // they are dropping the `JoinHandle`, we assume they are not
-            // interested in the panic and swallow it.
-            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                self.core().drop_future_or_output();
-            }));
+        let snapshot = match self.state().unset_join_interested_and_waker() {
+            Ok(snapshot) => snapshot,
+            Err(snapshot) => {
+                // It is our responsibility to drop the output. This is critical as
+                // the task output may not be `Send` and as such must remain with
+                // the scheduler or `JoinHandle`. i.e. if the output remains in the
+                // task structure until the task is deallocated, it may be dropped
+                // by a Waker on any arbitrary thread.
+                //
+                // Panics are delivered to the user via the `JoinHandle`. Given that
+                // they are dropping the `JoinHandle`, we assume they are not
+                // interested in the panic and swallow it.
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    self.core().drop_future_or_output();
+                }));
+                snapshot
+            }
+        };
+
+        if !snapshot.is_join_waker_set() {
+            // If the JOIN_WAKER bit is not set the join handle has exclusive access to the waker
+            // at this point following rule 2 in task/mod.rs so we drop the waker at this point
+            // together with the join handle.
+            unsafe {
+                self.trailer().set_waker(None);
+            }
         }
 
         // Drop the `JoinHandle` reference, possibly deallocating the task
@@ -311,7 +324,6 @@ where
     fn complete(self) {
         // The future has completed and its output has been written to the task
         // stage. We transition from running to complete.
-
         let snapshot = self.state().transition_to_complete();
 
         // We catch panics here in case dropping the future or waking the
@@ -341,6 +353,15 @@ where
                     _phantom: Default::default(),
                 })
             }));
+        }
+
+        if snapshot.is_join_interested() && snapshot.is_join_waker_set() {
+            // If JOIN_INTEREST and JOIN_WAKER are still set at this point, the runtime should
+            // drop the join waker as the join handle is not allowed to modify the waker
+            // following rule 6 in task/mod.rs
+            unsafe {
+                self.trailer().set_waker(None);
+            }
         }
 
         // The task has completed execution and will no longer be scheduled.
