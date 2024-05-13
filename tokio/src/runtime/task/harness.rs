@@ -284,21 +284,39 @@ where
     }
 
     pub(super) fn drop_join_handle_slow(self) {
+        use super::state::TransitionToJoinHandleDrop;
         // Try to unset `JOIN_INTEREST`. This must be done as a first step in
         // case the task concurrently completed.
-        if self.state().unset_join_interested().is_err() {
-            // It is our responsibility to drop the output. This is critical as
-            // the task output may not be `Send` and as such must remain with
-            // the scheduler or `JoinHandle`. i.e. if the output remains in the
-            // task structure until the task is deallocated, it may be dropped
-            // by a Waker on any arbitrary thread.
-            //
-            // Panics are delivered to the user via the `JoinHandle`. Given that
-            // they are dropping the `JoinHandle`, we assume they are not
-            // interested in the panic and swallow it.
-            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                self.core().drop_future_or_output();
-            }));
+        let transition = self.state().transition_to_join_handle_drop();
+        match transition {
+            TransitionToJoinHandleDrop::DropOutput => {
+                // It is our responsibility to drop the output. This is critical as
+                // the task output may not be `Send` and as such must remain with
+                // the scheduler or `JoinHandle`. i.e. if the output remains in the
+                // task structure until the task is deallocated, it may be dropped
+                // by a Waker on any arbitrary thread.
+                //
+                // Panics are delivered to the user via the `JoinHandle`. Given that
+                // they are dropping the `JoinHandle`, we assume they are not
+                // interested in the panic and swallow it.
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    self.core().drop_future_or_output();
+                }));
+            }
+            TransitionToJoinHandleDrop::DropJoinWaker => unsafe {
+                // If there is a waker associated with this task when the `JoinHandle` is about to get
+                // dropped we want to also drop this waker if the task is already completed.
+                self.trailer().set_waker(None);
+            },
+            TransitionToJoinHandleDrop::DropBoth => {
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    self.core().drop_future_or_output();
+                }));
+                unsafe {
+                    self.trailer().set_waker(None);
+                }
+            }
+            TransitionToJoinHandleDrop::DoNothing => (),
         }
 
         // Drop the `JoinHandle` reference, possibly deallocating the task
@@ -309,6 +327,7 @@ where
 
     /// Completes the task. This method assumes that the state is RUNNING.
     fn complete(self) {
+        use super::state::TransitionToTerminal;
         // The future has completed and its output has been written to the task
         // stage. We transition from running to complete.
 
@@ -346,8 +365,29 @@ where
         // The task has completed execution and will no longer be scheduled.
         let num_release = self.release();
 
-        if self.state().transition_to_terminal(num_release) {
-            self.dealloc();
+        match self.state().transition_to_terminal(num_release) {
+            TransitionToTerminal::OkDoNothing => (),
+            TransitionToTerminal::OkDealloc => {
+                self.dealloc();
+            }
+            TransitionToTerminal::FailedDropJoinWaker => {
+                // Safety: In this case we are the only one referencing the task and the active
+                // waker is the only one preventing the task from being deallocated so noone else
+                // will try to access the waker here.
+                unsafe {
+                    self.trailer().set_waker(None);
+                }
+
+                // We do not expect this to happen since `TransitionToTerminal::DropJoinWaker`
+                // will only be returned when after dropping the JoinWaker the task can be
+                // safely. Because after this failed transition the COMPLETE bit is still set
+                // its fine to transition to terminal in two steps here
+                if let TransitionToTerminal::OkDealloc =
+                    self.state().transition_to_terminal(num_release)
+                {
+                    self.dealloc();
+                }
+            }
         }
     }
 
@@ -387,7 +427,7 @@ fn can_read_output(header: &Header, trailer: &Trailer, waker: &Waker) -> bool {
 
     debug_assert!(snapshot.is_join_interested());
 
-    if !snapshot.is_complete() {
+    if !snapshot.is_complete() && !snapshot.is_terminal() {
         // If the task is not complete, try storing the provided waker in the
         // task's waker field.
 
