@@ -1,5 +1,5 @@
-use crate::sync::Notify;
-use std::future::Future;
+use crate::sync::{self, Notify};
+use std::future::{Future, IntoFuture};
 use std::sync::Arc;
 use std::task::{Context, RawWaker, RawWakerVTable, Waker};
 
@@ -116,4 +116,194 @@ fn watch_test() {
 
         let _ = rx.changed().await;
     });
+}
+
+struct AssertDropHandle {
+    is_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl AssertDropHandle {
+    #[track_caller]
+    fn assert_dropped(&self) {
+        assert!(self.is_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[track_caller]
+    fn assert_not_dropped(&self) {
+        assert!(!self.is_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
+
+struct AssertDrop {
+    is_dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl AssertDrop {
+    fn new() -> (Self, AssertDropHandle) {
+        let shared = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            AssertDrop {
+                is_dropped: shared.clone(),
+            },
+            AssertDropHandle {
+                is_dropped: shared.clone(),
+            },
+        )
+    }
+}
+impl Drop for AssertDrop {
+    fn drop(&mut self) {
+        self.is_dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn keke() {
+    use crate as tokio;
+    use std::time::Duration;
+    use tokio::runtime::Handle;
+    use tokio::sync::mpsc::channel;
+    use tokio::task::JoinHandle;
+    use tokio::time::{sleep, timeout};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let (tx, mut rx) = channel::<JoinHandle<AssertDrop>>(1);
+
+        let (a_tx, mut a_rx) = channel::<AssertDropHandle>(1);
+        let a = tokio::spawn(async move {
+            let (a_ad, a_handle) = AssertDrop::new();
+            a_tx.send(a_handle).await.unwrap();
+
+            let b = rx.recv().await.unwrap();
+            // let _ = b.await;
+
+            if timeout(Duration::from_secs(3), b).await.is_err() {
+                // Dropping handle b
+                println!("First task timeout elapsed");
+            } else {
+                // b completed
+                println!("First task handle awaited complete");
+            }
+            println!("a finished, dropping b handle");
+
+            a_ad
+        });
+
+        let (b_tx, mut b_rx) = channel::<AssertDropHandle>(1);
+        let b = tokio::spawn(async move {
+            let (b_ad, b_handle) = AssertDrop::new();
+            b_tx.send(b_handle).await.unwrap();
+
+            // tokio::time::sleep(Duration::from_secs(5)).await;
+            let _ = a.await;
+
+            println!("b finished, dropping a handle");
+            b_ad
+        });
+
+        tx.send(b).await.unwrap();
+        let b_handle = b_rx.recv().await.unwrap();
+        let a_handle = a_rx.recv().await.unwrap();
+
+        sleep(Duration::from_secs(5)).await;
+
+        a_handle.assert_dropped();
+        b_handle.assert_dropped();
+    });
+
+    // assert!(false);
+}
+
+use futures::FutureExt;
+use std::pin::Pin;
+use std::task::Poll;
+
+struct MyFuture<T: Future + 'static> {
+    fut: std::pin::Pin<Box<T>>,
+}
+
+impl<T> Future for MyFuture<T>
+where
+    T: Future + 'static,
+    T::Output: 'static,
+{
+    type Output = T::Output;
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.fut.poll_unpin(cx)
+    }
+}
+
+impl<T: Future + 'static> Drop for MyFuture<T> {
+    fn drop(&mut self) {
+        println!("Dropping MyFuture");
+    }
+}
+
+#[test]
+fn kaka() {
+    use crate as tokio;
+    use std::time::Duration;
+    use tokio::sync::mpsc::channel;
+    use tokio::task::JoinHandle;
+    use tokio::time::{sleep, timeout};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    rt.block_on(async {
+        let (tx, mut rx) = channel::<JoinHandle<AssertDrop>>(1);
+
+        let (a_tx, mut a_rx) = channel::<AssertDropHandle>(1);
+        let a = tokio::spawn(MyFuture {
+            fut: Box::pin(async move {
+                let (a_ad, a_handle) = AssertDrop::new();
+                a_tx.send(a_handle).await.unwrap();
+
+                let b = rx.recv().await.unwrap();
+                // let _ = b.await;
+
+                if timeout(Duration::from_secs(3), b).await.is_err() {
+                    // Dropping handle b
+                    println!("First task timeout elapsed");
+                } else {
+                    // b completed
+                    println!("First task handle awaited complete");
+                }
+                println!("a finished, dropping b handle");
+
+                a_ad
+            }),
+        });
+
+        let (b_tx, mut b_rx) = channel::<AssertDropHandle>(1);
+        let b = tokio::spawn(MyFuture {
+            fut: Box::pin(async move {
+                let (b_ad, b_handle) = AssertDrop::new();
+                b_tx.send(b_handle).await.unwrap();
+
+                // tokio::time::sleep(Duration::from_secs(5)).await;
+                let _ = a.await;
+
+                println!("b finished, dropping a handle");
+                b_ad
+            }),
+        });
+
+        tx.send(b).await.unwrap();
+        let b_handle = b_rx.recv().await.unwrap();
+        let a_handle = a_rx.recv().await.unwrap();
+
+        sleep(Duration::from_secs(5)).await;
+
+        a_handle.assert_dropped();
+        b_handle.assert_dropped();
+    });
+
+    // assert!(false);
 }

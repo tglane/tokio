@@ -321,11 +321,27 @@ where
                 // this task. It is our responsibility to drop the
                 // output.
                 self.core().drop_future_or_output();
+
+                // Eagerly drop the associated waker when the `JoinHandle` is not interested in the
+                // output of this task anymore. Without this the subsequent call to `dealloc` will
+                // not happen because the waker would still hold a reference to the tasks
+                // internals.
+                // Safety: Only the `JoinHandle` may set the `waker` field. When
+                // `JOIN_INTEREST` is **not** set, nothing else will touch the field.
+                unsafe { self.trailer().set_waker(None) };
             } else if snapshot.is_join_waker_set() {
                 // Notify the waker. Reading the waker field is safe per rule 4
                 // in task/mod.rs, since the JOIN_WAKER bit is set and the call
                 // to transition_to_complete() above set the COMPLETE bit.
                 self.trailer().wake_join();
+
+                // Eagerly drop the associated waker when the `JoinHandle` is not interested in the
+                // output of this task anymore. Without this the subsequent call to `dealloc` will
+                // not happen because the waker would still hold a reference to the tasks
+                // internals.
+                // Safety: Only the `JoinHandle` may set the `waker` field. When
+                // `JOIN_INTEREST` is **not** set, nothing else will touch the field.
+                unsafe { self.trailer().set_waker(None) };
             }
         }));
 
