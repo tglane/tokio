@@ -36,8 +36,12 @@ const JOIN_WAKER: usize = 0b10_000;
 /// The task has been forcibly cancelled.
 const CANCELLED: usize = 0b100_000;
 
+const TERMINAL: usize = 0b1_000_000;
+
 /// All bits.
-const STATE_MASK: usize = LIFECYCLE_MASK | NOTIFIED | JOIN_INTEREST | JOIN_WAKER | CANCELLED;
+// const STATE_MASK: usize = LIFECYCLE_MASK | NOTIFIED | JOIN_INTEREST | JOIN_WAKER | CANCELLED;
+const STATE_MASK: usize =
+    LIFECYCLE_MASK | NOTIFIED | JOIN_INTEREST | JOIN_WAKER | CANCELLED | TERMINAL;
 
 /// Bits used by the ref count portion of the state.
 const REF_COUNT_MASK: usize = !STATE_MASK;
@@ -87,6 +91,21 @@ pub(super) enum TransitionToNotifiedByVal {
 pub(crate) enum TransitionToNotifiedByRef {
     DoNothing,
     Submit,
+}
+
+#[must_use]
+pub(crate) enum TransitionToJoinHandleDrop {
+    DoNothing,
+    DropOutput,
+    DropJoinWaker,
+    DropBoth,
+}
+
+#[must_use]
+pub(crate) enum TransitionToTerminal {
+    OkDoNothing,
+    OkDealloc,
+    FailedDropJoinWaker,
 }
 
 /// All transitions are performed via RMW operations. This establishes an
@@ -174,6 +193,39 @@ impl State {
         })
     }
 
+    pub(super) fn transition_to_join_handle_drop(&self) -> TransitionToJoinHandleDrop {
+        self.fetch_update_action(|mut snapshot| {
+            assert!(snapshot.is_join_interested());
+
+            // Unset the `JOIN_INTEREST` bit because after this transition the join handle
+            // will get dropped thus removing the join interest.
+            snapshot.unset_join_interested();
+
+            if snapshot.is_complete() && (!snapshot.is_terminal() || !snapshot.is_join_waker_set())
+            {
+                // Task is complete but because its either not terminal yet or their is no join
+                // waker registered no one else is interested in the output of the task when the
+                // join handle is dropped so we also drop the output with the join handle.
+                (TransitionToJoinHandleDrop::DropOutput, None)
+            } else if snapshot.is_terminal() && snapshot.is_join_waker_set() {
+                // Task is terminal but there is a join waker registered so only the join handle
+                // and the join waker keep the task alive. We can drop the output and the waker
+                // together with the join handle to dealloc the task.
+                snapshot.unset_join_waker();
+                (TransitionToJoinHandleDrop::DropBoth, Some(snapshot))
+            } else if !snapshot.is_complete() && snapshot.is_join_waker_set() {
+                // Task is not complete but a join waker is registered. In this case we only drop
+                // the waker together with the join handle.
+                snapshot.unset_join_waker();
+                (TransitionToJoinHandleDrop::DropJoinWaker, Some(snapshot))
+            } else {
+                // Task is not complete and no join waker is registered so we do nothing special
+                // when dropping the join handle.
+                (TransitionToJoinHandleDrop::DoNothing, Some(snapshot))
+            }
+        })
+    }
+
     /// Transitions the task from `Running` -> `Complete`.
     pub(super) fn transition_to_complete(&self) -> Snapshot {
         const DELTA: usize = RUNNING | COMPLETE;
@@ -181,6 +233,7 @@ impl State {
         let prev = Snapshot(self.val.fetch_xor(DELTA, AcqRel));
         assert!(prev.is_running());
         assert!(!prev.is_complete());
+        assert!(!prev.is_terminal());
 
         Snapshot(prev.0 ^ DELTA)
     }
@@ -188,16 +241,44 @@ impl State {
     /// Transitions from `Complete` -> `Terminal`, decrementing the reference
     /// count the specified number of times.
     ///
-    /// Returns true if the task should be deallocated.
-    pub(super) fn transition_to_terminal(&self, count: usize) -> bool {
-        let prev = Snapshot(self.val.fetch_sub(count * REF_ONE, AcqRel));
-        assert!(
-            prev.ref_count() >= count,
-            "current: {}, sub: {}",
-            prev.ref_count(),
-            count
-        );
-        prev.ref_count() == count
+    /// Returns `TransitionToTerminal::OkDoNothing` if transition was successful but the task can
+    /// not already be deallocated.
+    /// Returns `TransitionToTerminal::OkDealloc` if the task should be deallocated.
+    /// Returns `TransitionToTerminal::FailedDropJoinWaker` if the transition failed because of a
+    /// the join waker being the only last. In this case the reference count will not be decremented
+    /// but the `JOIN_WAKER` bit will be unset.
+    pub(super) fn transition_to_terminal(&self, count: usize) -> TransitionToTerminal {
+        self.fetch_update_action(|mut snapshot| {
+            assert!(!snapshot.is_running());
+            assert!(snapshot.is_complete());
+            assert!(!snapshot.is_terminal());
+            assert!(
+                snapshot.ref_count() >= count,
+                "current: {}, sub: {}",
+                snapshot.ref_count(),
+                count
+            );
+
+            if snapshot.ref_count() == count {
+                // If the ref count of the task matches the count to decrease we know that there
+                // is no join waker left registered and we can safely deallocate the task.
+                snapshot.0 -= count * REF_ONE;
+                snapshot.0 |= TERMINAL;
+                (TransitionToTerminal::OkDealloc, Some(snapshot))
+            } else if !snapshot.is_join_interested() && snapshot.is_join_waker_set() {
+                // Otherwise if there is no join handle alive but a join waker registered the
+                // transition to the terminal state failed and we need to inform the caller that
+                // first the join waker needs to be dropped to reduce the reference count.
+                snapshot.unset_join_waker();
+                (TransitionToTerminal::FailedDropJoinWaker, Some(snapshot))
+            } else {
+                // Task transitions to terminal but there are still references to the task so
+                // we just decrease the refcount and do nothing else.
+                snapshot.0 -= count * REF_ONE;
+                snapshot.0 |= TERMINAL;
+                (TransitionToTerminal::OkDoNothing, Some(snapshot))
+            }
+        })
     }
 
     /// Transitions the state to `NOTIFIED`.
@@ -371,25 +452,6 @@ impl State {
             .map_err(|_| ())
     }
 
-    /// Tries to unset the `JOIN_INTEREST` flag.
-    ///
-    /// Returns `Ok` if the operation happens before the task transitions to a
-    /// completed state, `Err` otherwise.
-    pub(super) fn unset_join_interested(&self) -> UpdateResult {
-        self.fetch_update(|curr| {
-            assert!(curr.is_join_interested());
-
-            if curr.is_complete() {
-                return None;
-            }
-
-            let mut next = curr;
-            next.unset_join_interested();
-
-            Some(next)
-        })
-    }
-
     /// Sets the `JOIN_WAKER` bit.
     ///
     /// Returns `Ok` if the bit is set, `Err` otherwise. This operation fails if
@@ -555,6 +617,10 @@ impl Snapshot {
     /// Returns `true` if the task's future has completed execution.
     pub(super) fn is_complete(self) -> bool {
         self.0 & COMPLETE == COMPLETE
+    }
+
+    pub(super) fn is_terminal(self) -> bool {
+        self.0 & TERMINAL == TERMINAL
     }
 
     pub(super) fn is_join_interested(self) -> bool {
