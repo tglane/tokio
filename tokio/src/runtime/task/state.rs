@@ -190,24 +190,14 @@ impl State {
     ///
     /// Returns true if the task should be deallocated.
     pub(super) fn transition_to_terminal(&self, count: usize) -> bool {
-        self.fetch_update_action(|mut snapshot| {
-            assert!(
-                snapshot.ref_count() >= count,
-                "current: {}, sub: {}",
-                snapshot.ref_count(),
-                count
-            );
-
-            snapshot.0 -= count * REF_ONE;
-            if snapshot.is_join_interested() {
-                // If there is still a join handle alive at this point we unset the
-                // JOIN_WAKER bit so that the join handle gains exclusive access to
-                // the waker field to actually drop it.
-                snapshot.unset_join_waker();
-            }
-
-            (snapshot.ref_count() == 0, Some(snapshot))
-        })
+        let prev = Snapshot(self.val.fetch_sub(count * REF_ONE, AcqRel));
+        assert!(
+            prev.ref_count() >= count,
+            "current: {}, sub: {}",
+            prev.ref_count(),
+            count
+        );
+        prev.ref_count() == count
     }
 
     /// Transitions the state to `NOTIFIED`.
@@ -385,18 +375,37 @@ impl State {
     ///
     /// Returns `Ok` if the operation happens before the task transitions to a
     /// completed state, `Err` otherwise.
-    pub(super) fn unset_join_interested_and_waker(&self) -> UpdateResult {
-        self.fetch_update(|curr| {
-            assert!(curr.is_join_interested());
+    // pub(super) fn unset_join_interested_and_waker(&self) -> UpdateResult {
+    //     self.fetch_update(|curr| {
+    //         assert!(curr.is_join_interested());
 
-            if curr.is_complete() {
-                return None;
+    //         if curr.is_complete() {
+    //             return None;
+    //         }
+
+    //         let mut next = curr;
+    //         next.unset_join_interested();
+    //         if !curr.is_complete() {
+    //             next.unset_join_waker();
+    //         }
+
+    //         Some(next)
+    //     })
+    // }
+
+    /// Unsets the `JOIN_INTEREST` flag. If `COMPLETE` is not set, the `JOIN_WAKER`
+    /// flag is also unset.
+    pub(super) fn unset_join_interested_and_waker(&self) -> Snapshot {
+        self.fetch_update_action(|mut snapshot| {
+            assert!(snapshot.is_join_interested());
+
+            snapshot.unset_join_interested();
+
+            if !snapshot.is_complete() {
+                snapshot.unset_join_waker();
             }
 
-            let mut next = curr;
-            next.unset_join_interested();
-
-            Some(next)
+            (snapshot, Some(snapshot))
         })
     }
 
@@ -430,6 +439,26 @@ impl State {
             assert!(curr.is_join_waker_set());
 
             if curr.is_complete() {
+                return None;
+            }
+
+            let mut next = curr;
+            next.unset_join_waker();
+
+            Some(next)
+        })
+    }
+
+    /// Unsets the `JOIN_WAKER` bit only if the `JOIN_INTEREST` is still set.
+    ///
+    /// Returns `Ok` has been unset, `Err` otherwise. This operation requires
+    /// the task to be completed.
+    pub(super) fn unset_waker_if_join_interested(&self) -> UpdateResult {
+        self.fetch_update(|curr| {
+            assert!(curr.is_complete());
+            assert!(curr.is_join_waker_set());
+
+            if !curr.is_join_interested() {
                 return None;
             }
 
