@@ -117,11 +117,15 @@
 //! ```
 
 use crate::loom::cell::UnsafeCell;
-use crate::loom::sync::atomic::{AtomicBool, AtomicUsize};
+use crate::loom::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use crate::loom::sync::{Arc, Mutex, MutexGuard};
 use crate::task::coop::cooperative;
 use crate::util::linked_list::{self, GuardedLinkedList, LinkedList};
 use crate::util::WakeList;
+
+use super::Notify;
+
+use self::error::{RecvError, SendError, TryRecvError};
 
 use std::fmt;
 use std::future::Future;
@@ -242,6 +246,9 @@ pub struct Receiver<T> {
 
     /// Next position to read from
     next: u64,
+
+    /// Location of this receivers waiter in the sharded waiter list
+    bucket_idx: usize,
 }
 
 pub mod error {
@@ -333,20 +340,16 @@ pub mod error {
     impl std::error::Error for TryRecvError {}
 }
 
-use self::error::{RecvError, SendError, TryRecvError};
-
-use super::Notify;
-
 /// Data shared between senders and receivers.
 struct Shared<T> {
-    /// slots in the channel.
+    /// Slots in the channel.
     buffer: Box<[Mutex<Slot<T>>]>,
 
     /// Mask a position -> index.
     mask: usize,
 
-    /// Tail of the queue. Includes the rx wait list.
-    tail: Mutex<Tail>,
+    /// Tail of the queue.
+    tail: Tail,
 
     /// Number of outstanding Sender handles.
     num_tx: AtomicUsize,
@@ -360,17 +363,31 @@ struct Shared<T> {
 
 /// Next position to write a value.
 struct Tail {
+    /// Lock for atomic updates of position and total receiver count.
+    ///
+    /// This mutex protects the critical sections where a slot position is allocated
+    /// and the receiver count is read. These two operations must be atomic to ensure
+    /// that every message written to the channel has an accurate count of receivers
+    /// that need to read it.
+    update_lock: Mutex<()>,
+
     /// Next position to write to.
-    pos: u64,
+    pos: AtomicU64,
 
     /// Number of active receivers.
-    rx_cnt: usize,
+    total_rx_cnt: AtomicUsize,
 
     /// True if the channel is closed.
-    closed: bool,
+    closed: AtomicBool,
 
-    /// Receivers waiting for a value.
-    waiters: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
+    /// Sharded rx waiter list.
+    ///
+    /// To avoid contention on the list of waiters, it is sharded into multiple buckets
+    /// where each bucket is synchronized by its own mutex.
+    waiter_buckets: [Mutex<WaiterBucket>; 8],
+
+    #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
+    next_bucket_idx: AtomicUsize,
 }
 
 /// Slot in the buffer.
@@ -391,6 +408,21 @@ struct Slot<T> {
     /// The value is set by `send` when the write lock is held. When a reader
     /// drops, `rem` is decremented. When it hits zero, the value is dropped.
     val: Option<T>,
+}
+
+/// Single bucket of waiters in the sharded waiter list.
+struct WaiterBucket {
+    /// Receivers waiting for a value stored in this bucket.
+    waiters: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
+}
+
+impl WaiterBucket {
+    /// Create new waiter bucket.
+    fn new() -> Self {
+        Self {
+            waiters: LinkedList::new(),
+        }
+    }
 }
 
 /// An entry in the wait queue.
@@ -508,9 +540,14 @@ const MAX_RECEIVERS: usize = usize::MAX >> 2;
 pub fn channel<T: Clone>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     // SAFETY: In the line below we are creating one extra receiver, so there will be 1 in total.
     let tx = unsafe { Sender::new_with_receiver_count(1, capacity) };
+
+    // For the first receiver we can just use the first bucket.
+    let bucket_idx = 0;
+
     let rx = Receiver {
         shared: tx.shared.clone(),
         next: 0,
+        bucket_idx,
     };
     (tx, rx)
 }
@@ -561,12 +598,25 @@ impl<T> Sender<T> {
         let shared = Arc::new(Shared {
             buffer: buffer.collect(),
             mask: capacity - 1,
-            tail: Mutex::new(Tail {
-                pos: 0,
-                rx_cnt: receiver_count,
-                closed: receiver_count == 0,
-                waiters: LinkedList::new(),
-            }),
+            tail: Tail {
+                update_lock: Mutex::new(()),
+                pos: AtomicU64::new(0),
+                total_rx_cnt: AtomicUsize::new(receiver_count),
+                closed: AtomicBool::new(receiver_count == 0),
+                waiter_buckets: std::array::from_fn(|_| {
+                    // The receiver count for each bucket is set to zero by default because this
+                    // function does not create any receivers by itself.
+                    // The caller must ensure that the created receivers are evenly distributed across
+                    // the buckets.
+                    Mutex::new(WaiterBucket::new())
+                }),
+                #[cfg(not(all(
+                    not(loom),
+                    feature = "sync",
+                    any(feature = "rt", feature = "macros")
+                )))]
+                next_bucket_idx: AtomicUsize::new(0),
+            },
             num_tx: AtomicUsize::new(1),
             num_weak_tx: AtomicUsize::new(0),
             notify_last_rx_drop: Notify::new(),
@@ -627,39 +677,40 @@ impl<T> Sender<T> {
     /// # }
     /// ```
     pub fn send(&self, value: T) -> Result<usize, SendError<T>> {
-        let mut tail = self.shared.tail.lock();
+        // Lock the tail to ensure that the slot position has an accurate number of receivers that
+        // need to read the stored value.
+        let guard = self.shared.tail.update_lock.lock();
 
-        if tail.rx_cnt == 0 {
+        // Load remaining receiver count to store how many receivers are still expected to see the
+        // value stored in the slot.
+        let rem = self.shared.tail.total_rx_cnt.load(Acquire);
+        if rem == 0 {
             return Err(SendError(value));
         }
 
-        // Position to write into
-        let pos = tail.pos;
-        let rem = tail.rx_cnt;
+        // Reserve a slot position in the buffer and update the tail position to the next slot in
+        // the buffer.
+        let pos = self.shared.tail.pos.fetch_add(1, AcqRel);
         let idx = (pos & self.shared.mask as u64) as usize;
 
-        // Update the tail position
-        tail.pos = tail.pos.wrapping_add(1);
-
-        // Get the slot
+        // Get the slot and release the bucket lock.
         let mut slot = self.shared.buffer[idx].lock();
+        drop(guard);
 
-        // Track the position
+        // Track the position.
         slot.pos = pos;
 
-        // Set remaining receivers
+        // Set remaining receivers.
         slot.rem.with_mut(|v| *v = rem);
 
-        // Write the value
+        // Write the value.
         slot.val = Some(value);
 
         // Release the slot lock before notifying the receivers.
         drop(slot);
 
-        // Notify and release the mutex. This must happen after the slot lock is
-        // released, otherwise the writer lock bit could be cleared while another
-        // thread is in the critical section.
-        self.shared.notify_rx(tail);
+        // Notify all waiters that are shared into multiple buckets.
+        self.shared.notify_all_buckets();
 
         Ok(rem)
     }
@@ -742,9 +793,9 @@ impl<T> Sender<T> {
     /// # }
     /// ```
     pub fn len(&self) -> usize {
-        let tail = self.shared.tail.lock();
+        let pos = self.shared.tail.pos.load(Acquire);
 
-        let base_idx = (tail.pos & self.shared.mask as u64) as usize;
+        let base_idx = (pos & self.shared.mask as u64) as usize;
         let mut low = 0;
         let mut high = self.shared.buffer.len();
         while low < high {
@@ -789,9 +840,9 @@ impl<T> Sender<T> {
     /// # }
     /// ```
     pub fn is_empty(&self) -> bool {
-        let tail = self.shared.tail.lock();
+        let pos = self.shared.tail.pos.load(Acquire);
 
-        let idx = (tail.pos.wrapping_sub(1) & self.shared.mask as u64) as usize;
+        let idx = (pos.wrapping_sub(1) & self.shared.mask as u64) as usize;
         self.shared.buffer[idx].lock().rem.load(SeqCst) == 0
     }
 
@@ -832,8 +883,7 @@ impl<T> Sender<T> {
     /// # }
     /// ```
     pub fn receiver_count(&self) -> usize {
-        let tail = self.shared.tail.lock();
-        tail.rx_cnt
+        self.shared.tail.total_rx_cnt.load(Acquire)
     }
 
     /// Returns `true` if senders belong to the same channel.
@@ -888,12 +938,8 @@ impl<T> Sender<T> {
         loop {
             let notified = self.shared.notify_last_rx_drop.notified();
 
-            {
-                // Ensure the lock drops if the channel isn't closed
-                let tail = self.shared.tail.lock();
-                if tail.closed {
-                    return;
-                }
+            if self.shared.tail.closed.load(Acquire) {
+                return;
             }
 
             notified.await;
@@ -901,10 +947,8 @@ impl<T> Sender<T> {
     }
 
     fn close_channel(&self) {
-        let mut tail = self.shared.tail.lock();
-        tail.closed = true;
-
-        self.shared.notify_rx(tail);
+        self.shared.tail.closed.store(true, Release);
+        self.shared.notify_all_buckets();
     }
 
     /// Returns the number of [`Sender`] handles.
@@ -920,63 +964,75 @@ impl<T> Sender<T> {
 
 /// Create a new `Receiver` which reads starting from the tail.
 fn new_receiver<T>(shared: Arc<Shared<T>>) -> Receiver<T> {
-    let mut tail = shared.tail.lock();
+    // Guard the tail position to atomically increment the number of receivers and fetch the
+    // current tail position. This is necessary to ensure that each slot stores the correct number
+    // of receivers that need to read the stored value.
+    let guard = shared.tail.update_lock.lock();
 
-    assert!(tail.rx_cnt != MAX_RECEIVERS, "max receivers");
+    // Atomically increment the number of receivers and check for max receivers.
+    let prev_rx_cnt = shared.tail.total_rx_cnt.fetch_add(1, AcqRel);
+    assert_ne!(prev_rx_cnt, MAX_RECEIVERS, "max receivers");
 
-    if tail.rx_cnt == 0 {
+    // Select a bucket in which the new receiver will store its waiters.
+    #[cfg(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros")))]
+    let bucket_idx = crate::runtime::context::thread_rng_n(8) as usize;
+    #[cfg(not(all(not(loom), feature = "sync", any(feature = "rt", feature = "macros"))))]
+    let bucket_idx = shared.tail.next_bucket_idx.fetch_add(1, Relaxed) % 8;
+
+    if prev_rx_cnt == 0 {
         // Potentially need to re-open the channel, if a new receiver has been added between calls
         // to poll(). Note that we use rx_cnt == 0 instead of is_closed since is_closed also
         // applies if the sender has been dropped
-        tail.closed = false;
+        shared.tail.closed.store(false, Release);
     }
 
-    tail.rx_cnt = tail.rx_cnt.checked_add(1).expect("overflow");
-    let next = tail.pos;
+    // Read current tail position. This is from where the new receiver starts reading data from the
+    // shared buffer.
+    let next = shared.tail.pos.load(Acquire);
 
-    drop(tail);
+    drop(guard);
 
-    Receiver { shared, next }
+    Receiver {
+        shared,
+        next,
+        bucket_idx,
+    }
 }
 
 /// List used in `Shared::notify_rx`. It wraps a guarded linked list
 /// and gates the access to it on the `Shared.tail` mutex. It also empties
 /// the list on drop.
-struct WaitersList<'a, T> {
+struct WaitersList {
     list: GuardedLinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
     is_empty: bool,
-    shared: &'a Shared<T>,
 }
 
-impl<'a, T> Drop for WaitersList<'a, T> {
+impl Drop for WaitersList {
     fn drop(&mut self) {
         // If the list is not empty, we unlink all waiters from it.
         // We do not wake the waiters to avoid double panics.
         if !self.is_empty {
-            let _lock_guard = self.shared.tail.lock();
             while self.list.pop_back().is_some() {}
         }
     }
 }
 
-impl<'a, T> WaitersList<'a, T> {
+impl WaitersList {
     fn new(
         unguarded_list: LinkedList<Waiter, <Waiter as linked_list::Link>::Target>,
-        guard: Pin<&'a Waiter>,
-        shared: &'a Shared<T>,
+        guard: Pin<&Waiter>,
     ) -> Self {
         let guard_ptr = NonNull::from(guard.get_ref());
         let list = unguarded_list.into_guarded(guard_ptr);
         WaitersList {
             list,
             is_empty: false,
-            shared,
         }
     }
 
     /// Removes the last element from the guarded list. Modifying this list
     /// requires an exclusive access to the main list in `Notify`.
-    fn pop_back_locked(&mut self, _tail: &mut Tail) -> Option<NonNull<Waiter>> {
+    fn pop_back_locked(&mut self, _waiter_bucket: &mut WaiterBucket) -> Option<NonNull<Waiter>> {
         let result = self.list.pop_back();
         if result.is_none() {
             // Save information about emptiness to avoid waiting for lock
@@ -988,7 +1044,15 @@ impl<'a, T> WaitersList<'a, T> {
 }
 
 impl<T> Shared<T> {
-    fn notify_rx<'a, 'b: 'a>(&'b self, mut tail: MutexGuard<'a, Tail>) {
+    fn notify_all_buckets(&self) {
+        for bucket in self.tail.waiter_buckets.iter() {
+            self.notify_rx_bucket(bucket);
+        }
+    }
+
+    fn notify_rx_bucket(&self, waiter_bucket: &Mutex<WaiterBucket>) {
+        let mut bucket_guard = waiter_bucket.lock();
+
         // It is critical for `GuardedLinkedList` safety that the guard node is
         // pinned in memory and is not dropped until the guarded list is dropped.
         let guard = Waiter::new();
@@ -1002,30 +1066,22 @@ impl<T> Shared<T> {
         // * This wrapper will empty the list on drop. It is critical for safety
         //   that we will not leave any list entry with a pointer to the local
         //   guard node after this function returns / panics.
-        let mut list = WaitersList::new(std::mem::take(&mut tail.waiters), guard.as_ref(), self);
+        let mut list = WaitersList::new(std::mem::take(&mut bucket_guard.waiters), guard.as_ref());
 
         let mut wakers = WakeList::new();
         'outer: loop {
             while wakers.can_push() {
-                match list.pop_back_locked(&mut tail) {
-                    Some(waiter) => {
-                        unsafe {
-                            // Safety: accessing `waker` is safe because
-                            // the tail lock is held.
-                            if let Some(waker) = (*waiter.as_ptr()).waker.take() {
-                                wakers.push(waker);
-                            }
-
-                            // Safety: `queued` is atomic.
-                            let queued = &(*waiter.as_ptr()).queued;
-                            // `Relaxed` suffices because the tail lock is held.
-                            assert!(queued.load(Relaxed));
-                            // `Release` is needed to synchronize with `Recv::drop`.
-                            // It is critical to set this variable **after** waker
-                            // is extracted, otherwise we may data race with `Recv::drop`.
-                            queued.store(false, Release);
+                // Note: pop_back_locked signature needs updating - see below
+                match list.pop_back_locked(&mut bucket_guard) {
+                    Some(waiter) => unsafe {
+                        if let Some(waker) = (*waiter.as_ptr()).waker.take() {
+                            wakers.push(waker);
                         }
-                    }
+
+                        let queued = &(*waiter.as_ptr()).queued;
+                        assert!(queued.load(Relaxed));
+                        queued.store(false, Release);
+                    },
                     None => {
                         break 'outer;
                     }
@@ -1033,21 +1089,16 @@ impl<T> Shared<T> {
             }
 
             // Release the lock before waking.
-            drop(tail);
-
-            // Before we acquire the lock again all sorts of things can happen:
-            // some waiters may remove themselves from the list and new waiters
-            // may be added. This is fine since at worst we will unnecessarily
-            // wake up waiters which will then queue themselves again.
+            drop(bucket_guard);
 
             wakers.wake_all();
 
             // Acquire the lock again.
-            tail = self.tail.lock();
+            bucket_guard = waiter_bucket.lock();
         }
 
         // Release the lock before waking.
-        drop(tail);
+        drop(bucket_guard);
 
         wakers.wake_all();
     }
@@ -1161,8 +1212,7 @@ impl<T> Receiver<T> {
     /// # }
     /// ```
     pub fn len(&self) -> usize {
-        let next_send_pos = self.shared.tail.lock().pos;
-        (next_send_pos - self.next) as usize
+        (self.shared.tail.pos.load(Acquire) - self.next) as usize
     }
 
     /// Returns true if there aren't any messages in the channel that the [`Receiver`]
@@ -1225,24 +1275,13 @@ impl<T> Receiver<T> {
         let idx = (self.next & self.shared.mask as u64) as usize;
 
         // The slot holding the next value to read
-        let mut slot = self.shared.buffer[idx].lock();
+        let slot = self.shared.buffer[idx].lock();
 
         if slot.pos != self.next {
-            // Release the `slot` lock before attempting to acquire the `tail`
-            // lock. This is required because `send2` acquires the tail lock
-            // first followed by the slot lock. Acquiring the locks in reverse
-            // order here would result in a potential deadlock: `recv_ref`
-            // acquires the `slot` lock and attempts to acquire the `tail` lock
-            // while `send2` acquired the `tail` lock and attempts to acquire
-            // the slot lock.
-            drop(slot);
-
             let mut old_waker = None;
 
-            let mut tail = self.shared.tail.lock();
-
-            // Acquire slot lock again
-            slot = self.shared.buffer[idx].lock();
+            // Lock the bucket containing the waiter for this receiver.
+            let mut bucket = self.shared.tail.waiter_buckets[self.bucket_idx].lock();
 
             // Make sure the position did not change. This could happen in the
             // unlikely event that the buffer is wrapped between dropping the
@@ -1254,7 +1293,7 @@ impl<T> Receiver<T> {
                     // At this point the channel is empty for *this* receiver. If
                     // it's been closed, then that's what we return, otherwise we
                     // set a waker and return empty.
-                    if tail.closed {
+                    if self.shared.tail.closed.load(Acquire) {
                         return Err(TryRecvError::Closed);
                     }
 
@@ -1282,7 +1321,7 @@ impl<T> Receiver<T> {
                                     // `Relaxed` order suffices: all the readers will
                                     // synchronize with this write through the tail lock.
                                     (*ptr).queued.store(true, Relaxed);
-                                    tail.waiters.push_front(NonNull::new_unchecked(&mut *ptr));
+                                    bucket.waiters.push_front(NonNull::new_unchecked(&mut *ptr));
                                 }
                             });
                         }
@@ -1290,7 +1329,7 @@ impl<T> Receiver<T> {
 
                     // Drop the old waker after releasing the locks.
                     drop(slot);
-                    drop(tail);
+                    drop(bucket);
                     drop(old_waker);
 
                     return Err(TryRecvError::Empty);
@@ -1301,11 +1340,12 @@ impl<T> Receiver<T> {
                 // catch up by skipping dropped messages and setting the
                 // internal cursor to the **oldest** message stored by the
                 // channel.
-                let next = tail.pos.wrapping_sub(self.shared.buffer.len() as u64);
+                let tail_pos = self.shared.tail.pos.load(Acquire);
+                let next = tail_pos.wrapping_sub(self.shared.buffer.len() as u64);
 
                 let missed = next.wrapping_sub(self.next);
 
-                drop(tail);
+                drop(bucket);
 
                 // The receiver is slow but no values have been missed
                 if missed == 0 {
@@ -1545,19 +1585,27 @@ impl<T: Clone> Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let mut tail = self.shared.tail.lock();
+        // Guard the tail position to atomically increment the number of receivers and fetch the
+        // current tail position. This is necessary to ensure that each slot stores the correct number
+        // of receivers that need to read the stored value.
+        let guard = self.shared.tail.update_lock.lock();
 
-        tail.rx_cnt -= 1;
-        let until = tail.pos;
-        let remaining_rx = tail.rx_cnt;
+        // Atomically decrement the total number of receivers.
+        let prev_rx_cnt = self.shared.tail.total_rx_cnt.fetch_sub(1, AcqRel);
 
-        if remaining_rx == 0 {
+        // Read current tail position.
+        let until = self.shared.tail.pos.load(Acquire);
+
+        // If we were the last receiver, mark as closed and notify waiters.
+        if prev_rx_cnt == 1 {
+            self.shared.tail.closed.store(true, Release);
+            drop(guard);
             self.shared.notify_last_rx_drop.notify_waiters();
-            tail.closed = true;
+        } else {
+            drop(guard);
         }
 
-        drop(tail);
-
+        // Clean up remaining slots.
         while self.next < until {
             match self.recv_ref(None) {
                 Ok(_) => {}
@@ -1636,9 +1684,13 @@ impl<'a, T> Drop for Recv<'a, T> {
         if queued {
             // Acquire the tail lock. This is required for safety before accessing
             // the waiter node.
-            let mut tail = self.receiver.shared.tail.lock();
+            // let mut tail = self.receiver.shared.tail.lock();
+            // Acquire the lock of the notify bucket of this receiver. This is required for safety
+            // before accessing the waiter node.
+            let bucket_idx = self.receiver.bucket_idx;
+            let mut waiter_bucket = self.receiver.shared.tail.waiter_buckets[bucket_idx].lock();
 
-            // Safety: tail lock is held.
+            // Safety: Lock of the waiter bucket is held.
             // `Relaxed` order suffices because we hold the tail lock.
             let queued = self
                 .waiter
@@ -1648,11 +1700,11 @@ impl<'a, T> Drop for Recv<'a, T> {
             if queued {
                 // Remove the node
                 //
-                // safety: tail lock is held and the wait node is verified to be in
-                // the list.
+                // safety: Lock of the waiter bucket is held and the wait node is verified to be
+                // in the list.
                 unsafe {
                     self.waiter.0.with_mut(|ptr| {
-                        tail.waiters.remove((&mut *ptr).into());
+                        waiter_bucket.waiters.remove((&mut *ptr).into());
                     });
                 }
             }
